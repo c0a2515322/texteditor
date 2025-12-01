@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io' show Platform;
 import 'dart:math';
 import 'package:flutter/foundation.dart';
@@ -12,8 +13,31 @@ void main() {
   runApp(const TextEditorApp());
 }
 
-class TextEditorApp extends StatelessWidget {
+class TextEditorApp extends StatefulWidget {
   const TextEditorApp({super.key});
+
+  static void setThemeMode(BuildContext context, ThemeMode mode) {
+    final state = context.findAncestorStateOfType<_TextEditorAppState>();
+    state?.setThemeMode(mode);
+  }
+
+  static ThemeMode getThemeMode(BuildContext context) {
+    final state = context.findAncestorStateOfType<_TextEditorAppState>();
+    return state?._themeMode ?? ThemeMode.system;
+  }
+
+  @override
+  State<TextEditorApp> createState() => _TextEditorAppState();
+}
+
+class _TextEditorAppState extends State<TextEditorApp> {
+  ThemeMode _themeMode = ThemeMode.system;
+
+  void setThemeMode(ThemeMode mode) {
+    setState(() {
+      _themeMode = mode;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -21,10 +45,22 @@ class TextEditorApp extends StatelessWidget {
       title: 'Simple Text Editor',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blueGrey),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.blueGrey,
+          brightness: Brightness.light,
+        ),
         useMaterial3: true,
         fontFamily: 'Roboto',
       ),
+      darkTheme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.blueGrey,
+          brightness: Brightness.dark,
+        ),
+        useMaterial3: true,
+        fontFamily: 'Roboto',
+      ),
+      themeMode: _themeMode,
       home: const TextEditorPage(),
     );
   }
@@ -39,6 +75,30 @@ class TextEditorPage extends StatefulWidget {
 
 class IndentIntent extends Intent {
   const IndentIntent();
+}
+
+class SaveIntent extends Intent {
+  const SaveIntent();
+}
+
+class OpenIntent extends Intent {
+  const OpenIntent();
+}
+
+class UndoIntent extends Intent {
+  const UndoIntent();
+}
+
+class RedoIntent extends Intent {
+  const RedoIntent();
+}
+
+class SearchIntent extends Intent {
+  const SearchIntent();
+}
+
+class NewTabIntent extends Intent {
+  const NewTabIntent();
 }
 
 class _TextEditorPageState extends State<TextEditorPage>
@@ -59,6 +119,9 @@ class _TextEditorPageState extends State<TextEditorPage>
   bool _isSearchVisible = false;
   final TextEditingController _searchController = TextEditingController();
 
+  // Debounce timer for content width calculation
+  Timer? _contentWidthTimer;
+
   @override
   void initState() {
     super.initState();
@@ -67,6 +130,7 @@ class _TextEditorPageState extends State<TextEditorPage>
 
   @override
   void dispose() {
+    _contentWidthTimer?.cancel();
     for (var tab in _tabs) {
       tab.dispose();
     }
@@ -113,22 +177,31 @@ class _TextEditorPageState extends State<TextEditorPage>
     });
   }
 
+  // Scroll synchronization flags to prevent infinite loops
+  bool _isSyncingScroll = false;
+
   void _onTextScroll(EditorTabState tab) {
+    if (_isSyncingScroll) return;
     if (tab.lineNumbersScrollController.hasClients &&
         tab.textScrollController.hasClients) {
       if (tab.lineNumbersScrollController.offset !=
           tab.textScrollController.offset) {
+        _isSyncingScroll = true;
         tab.lineNumbersScrollController.jumpTo(tab.textScrollController.offset);
+        _isSyncingScroll = false;
       }
     }
   }
 
   void _onLineNumberScroll(EditorTabState tab) {
+    if (_isSyncingScroll) return;
     if (tab.textScrollController.hasClients &&
         tab.lineNumbersScrollController.hasClients) {
       if (tab.textScrollController.offset !=
           tab.lineNumbersScrollController.offset) {
+        _isSyncingScroll = true;
         tab.textScrollController.jumpTo(tab.lineNumbersScrollController.offset);
+        _isSyncingScroll = false;
       }
     }
   }
@@ -142,63 +215,82 @@ class _TextEditorPageState extends State<TextEditorPage>
       return;
     }
 
-    // Undo/Redo logic
+    // Undo/Redo logic with debounce to batch rapid changes
     if (tab.controller.text != tab.content) {
-      final oldText = tab.content;
       final newText = tab.controller.text;
 
-      tab.changeStack.add(
-        Change(
-          oldText,
-          () {
-            // Only update text if it's different to avoid resetting cursor/composition
-            if (tab.controller.text != newText) {
-              tab.controller.text = newText;
-            }
-            tab.content = newText;
-            _updateTabState(tab);
-          },
-          (oldVal) {
-            tab.controller.text = oldVal;
-            tab.content = oldVal;
-            _updateTabState(tab);
-          },
-        ),
-      );
+      // Store the pending text for debounced undo
+      tab.pendingUndoText ??= tab.content;
+
+      tab.undoDebounceTimer?.cancel();
+      tab.undoDebounceTimer = Timer(const Duration(milliseconds: 500), () {
+        if (tab.pendingUndoText != null && tab.pendingUndoText != newText) {
+          final oldText = tab.pendingUndoText!;
+          tab.changeStack.add(
+            Change<String>(
+              oldText,
+              () {
+                if (tab.controller.text != newText) {
+                  tab.controller.text = newText;
+                }
+                tab.content = newText;
+                _updateTabState(tab);
+              },
+              (oldVal) {
+                tab.controller.text = oldVal;
+                tab.content = oldVal;
+                _updateTabState(tab);
+              },
+            ),
+          );
+        }
+        tab.pendingUndoText = null;
+      });
+
       tab.content = newText;
     }
   }
 
   void _updateTabState(EditorTabState tab) {
-    setState(() {
-      tab.characterCount = tab.controller.text.length;
-      tab.isDirty = true;
-      _updateCursorPosition(tab);
-      tab.updateHighlight();
-    });
+    tab.characterCount = tab.controller.text.length;
+    tab.lineCount = tab.controller.text.isEmpty
+        ? 1
+        : tab.controller.text.split('\n').length;
+    tab.isDirty = true;
+    _updateCursorPosition(tab);
+    tab.updateHighlight();
+    // Only call setState to update the status bar, not the entire widget
+    if (mounted) {
+      setState(() {});
+    }
     if (!_isWordWrap) {
       _calculateContentWidth(tab);
     }
   }
 
   void _calculateContentWidth(EditorTabState tab) {
-    final textSpan = TextSpan(
-      text: tab.controller.text,
-      style: TextStyle(fontFamily: _fontFamily, fontSize: _fontSize),
-    );
-    final textPainter = TextPainter(
-      text: textSpan,
-      textDirection: TextDirection.ltr,
-    );
-    textPainter.layout();
+    _contentWidthTimer?.cancel();
+    _contentWidthTimer = Timer(const Duration(milliseconds: 100), () {
+      if (!mounted) return;
+      final textSpan = TextSpan(
+        text: tab.controller.text,
+        style: TextStyle(fontFamily: _fontFamily, fontSize: _fontSize),
+      );
+      final textPainter = TextPainter(
+        text: textSpan,
+        textDirection: TextDirection.ltr,
+      );
+      textPainter.layout();
 
-    final newWidth = textPainter.width + 64.0;
+      final newWidth = textPainter.width + 64.0;
 
-    if (newWidth != _contentWidth) {
-      setState(() {
-        _contentWidth = newWidth;
-      });
-    }
+      if (newWidth != _contentWidth) {
+        setState(() {
+          _contentWidth = newWidth;
+        });
+      }
+      textPainter.dispose();
+    });
   }
 
   void _updateCursorPosition(EditorTabState tab) {
@@ -211,10 +303,8 @@ class _TextEditorPageState extends State<TextEditorPage>
     final lastNewLineIndex = beforeCursor.lastIndexOf('\n');
     final columnCount = selection.baseOffset - (lastNewLineIndex + 1) + 1;
 
-    setState(() {
-      tab.currentLine = lineCount;
-      tab.currentColumn = columnCount;
-    });
+    tab.currentLine = lineCount;
+    tab.currentColumn = columnCount;
   }
 
   Future<bool> _checkUnsavedChanges(int index) async {
@@ -412,10 +502,11 @@ class _TextEditorPageState extends State<TextEditorPage>
   void _showSettings() {
     final index = _tabController.index;
     final tab = _tabs[index];
+    ThemeMode currentTheme = TextEditorApp.getThemeMode(context);
 
     showDialog(
       context: context,
-      builder: (context) {
+      builder: (dialogContext) {
         return StatefulBuilder(
           builder: (context, setStateDialog) {
             return AlertDialog(
@@ -424,6 +515,37 @@ class _TextEditorPageState extends State<TextEditorPage>
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    // Theme Mode
+                    Row(
+                      children: [
+                        const Text('Theme: '),
+                        const SizedBox(width: 8),
+                        DropdownButton<ThemeMode>(
+                          value: currentTheme,
+                          items: const [
+                            DropdownMenuItem(
+                              value: ThemeMode.system,
+                              child: Text('System'),
+                            ),
+                            DropdownMenuItem(
+                              value: ThemeMode.light,
+                              child: Text('Light'),
+                            ),
+                            DropdownMenuItem(
+                              value: ThemeMode.dark,
+                              child: Text('Dark'),
+                            ),
+                          ],
+                          onChanged: (val) {
+                            if (val != null) {
+                              setStateDialog(() => currentTheme = val);
+                              TextEditorApp.setThemeMode(this.context, val);
+                            }
+                          },
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
                     Row(
                       children: [
                         const Text('Font Family: '),
@@ -611,341 +733,399 @@ class _TextEditorPageState extends State<TextEditorPage>
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: _tabs.isEmpty
-            ? const Text('Text Editor')
-            : TabBar(
-                controller: _tabController,
-                isScrollable: true,
-                onTap: (index) {
-                  setState(() {}); // Update UI for active tab
-                },
-                tabs: _tabs.map((tab) {
-                  String title = tab.filePath == null
-                      ? 'Untitled'
-                      : (kIsWeb
-                            ? tab.filePath!
-                            : tab.filePath!.split(pathSeparator).last);
-                  if (tab.isDirty) title += '*';
-                  return Tab(
-                    child: Row(
-                      children: [
-                        GestureDetector(
-                          onTap: () => _renameFile(tab),
-                          child: Text(title),
-                        ),
-                        const SizedBox(width: 4),
-                        GestureDetector(
-                          onTap: () => _closeTab(_tabs.indexOf(tab)),
-                          child: const Icon(Icons.close, size: 16),
-                        ),
-                      ],
+    return Shortcuts(
+      shortcuts: {
+        LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyS):
+            const SaveIntent(),
+        LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyO):
+            const OpenIntent(),
+        LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyZ):
+            const UndoIntent(),
+        LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyY):
+            const RedoIntent(),
+        LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyF):
+            const SearchIntent(),
+        LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyN):
+            const NewTabIntent(),
+      },
+      child: Actions(
+        actions: {
+          SaveIntent: CallbackAction<SaveIntent>(
+            onInvoke: (intent) => _saveFile(),
+          ),
+          OpenIntent: CallbackAction<OpenIntent>(
+            onInvoke: (intent) => _openFile(),
+          ),
+          UndoIntent: CallbackAction<UndoIntent>(onInvoke: (intent) => _undo()),
+          RedoIntent: CallbackAction<RedoIntent>(onInvoke: (intent) => _redo()),
+          SearchIntent: CallbackAction<SearchIntent>(
+            onInvoke: (intent) {
+              setState(() {
+                _isSearchVisible = !_isSearchVisible;
+              });
+              return null;
+            },
+          ),
+          NewTabIntent: CallbackAction<NewTabIntent>(
+            onInvoke: (intent) => _addNewTab(),
+          ),
+        },
+        child: Focus(
+          autofocus: true,
+          child: Scaffold(
+            appBar: AppBar(
+              title: _tabs.isEmpty
+                  ? const Text('Text Editor')
+                  : TabBar(
+                      controller: _tabController,
+                      isScrollable: true,
+                      onTap: (index) {
+                        setState(() {}); // Update UI for active tab
+                      },
+                      tabs: _tabs.map((tab) {
+                        String title = tab.filePath == null
+                            ? 'Untitled'
+                            : (kIsWeb
+                                  ? tab.filePath!
+                                  : tab.filePath!.split(pathSeparator).last);
+                        if (tab.isDirty) title += '*';
+                        return Tab(
+                          child: Row(
+                            children: [
+                              GestureDetector(
+                                onTap: () => _renameFile(tab),
+                                child: Text(title),
+                              ),
+                              const SizedBox(width: 4),
+                              GestureDetector(
+                                onTap: () => _closeTab(_tabs.indexOf(tab)),
+                                child: const Icon(Icons.close, size: 16),
+                              ),
+                            ],
+                          ),
+                        );
+                      }).toList(),
                     ),
-                  );
-                }).toList(),
-              ),
-        backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.note_add_outlined),
-            tooltip: 'New Tab',
-            onPressed: () => _addNewTab(),
-          ),
-          IconButton(
-            icon: const Icon(Icons.folder_open_outlined),
-            tooltip: 'Open File',
-            onPressed: _openFile,
-          ),
-          IconButton(
-            icon: const Icon(Icons.save_outlined),
-            tooltip: 'Save File',
-            onPressed: _saveFile,
-          ),
-          IconButton(
-            icon: const Icon(Icons.settings_outlined),
-            tooltip: 'Settings',
-            onPressed: _showSettings,
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          // Toolbar
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            color: Theme.of(context).colorScheme.surfaceContainerLow,
-            child: Row(
-              children: [
+              backgroundColor: Theme.of(
+                context,
+              ).colorScheme.surfaceContainerHighest,
+              actions: [
                 IconButton(
-                  icon: const Icon(Icons.undo),
-                  tooltip: 'Undo',
-                  onPressed: _undo,
+                  icon: const Icon(Icons.note_add_outlined),
+                  tooltip: 'New Tab',
+                  onPressed: () => _addNewTab(),
                 ),
                 IconButton(
-                  icon: const Icon(Icons.redo),
-                  tooltip: 'Redo',
-                  onPressed: _redo,
+                  icon: const Icon(Icons.folder_open_outlined),
+                  tooltip: 'Open File',
+                  onPressed: _openFile,
                 ),
                 IconButton(
-                  icon: const Icon(Icons.copy_all),
-                  tooltip: 'Copy All',
-                  onPressed: _copyAll,
+                  icon: const Icon(Icons.save_outlined),
+                  tooltip: 'Save File',
+                  onPressed: _saveFile,
                 ),
-                const SizedBox(width: 16),
                 IconButton(
-                  icon: const Icon(Icons.search),
-                  tooltip: 'Search',
-                  onPressed: () {
-                    setState(() {
-                      _isSearchVisible = !_isSearchVisible;
-                    });
-                  },
+                  icon: const Icon(Icons.settings_outlined),
+                  tooltip: 'Settings',
+                  onPressed: _showSettings,
                 ),
-                if (_isSearchVisible) ...[
-                  const SizedBox(width: 8),
-                  SizedBox(
-                    width: 200,
-                    height: 40,
-                    child: TextField(
-                      controller: _searchController,
-                      decoration: InputDecoration(
-                        hintText: 'Search...',
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                        ),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        suffixIcon: IconButton(
-                          icon: const Icon(Icons.arrow_forward),
-                          onPressed: _performSearch,
-                        ),
-                      ),
-                      onSubmitted: (_) => _performSearch(),
-                    ),
-                  ),
-                ],
               ],
             ),
-          ),
-          Expanded(
-            child: _tabs.isEmpty
-                ? const Center(child: Text('No tabs open'))
-                : TabBarView(
-                    controller: _tabController,
-                    physics:
-                        const NeverScrollableScrollPhysics(), // Disable swipe
-                    children: _tabs.map((tab) {
-                      final lineCount = tab.controller.text.split('\n').length;
-                      final lineHeight = _fontSize * 1.5;
-
-                      return Column(
-                        children: [
-                          Expanded(
-                            child: Padding(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 0.0,
-                                vertical: 8.0,
+            body: Column(
+              children: [
+                // Toolbar
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
+                  color: Theme.of(context).colorScheme.surfaceContainerLow,
+                  child: Row(
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.undo),
+                        tooltip: 'Undo',
+                        onPressed: _undo,
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.redo),
+                        tooltip: 'Redo',
+                        onPressed: _redo,
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.copy_all),
+                        tooltip: 'Copy All',
+                        onPressed: _copyAll,
+                      ),
+                      const SizedBox(width: 16),
+                      IconButton(
+                        icon: const Icon(Icons.search),
+                        tooltip: 'Search',
+                        onPressed: () {
+                          setState(() {
+                            _isSearchVisible = !_isSearchVisible;
+                          });
+                        },
+                      ),
+                      if (_isSearchVisible) ...[
+                        const SizedBox(width: 8),
+                        SizedBox(
+                          width: 200,
+                          height: 40,
+                          child: TextField(
+                            controller: _searchController,
+                            decoration: InputDecoration(
+                              hintText: 'Search...',
+                              contentPadding: const EdgeInsets.symmetric(
+                                horizontal: 8,
                               ),
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  if (_showLineNumbers)
-                                    Container(
-                                      width: 50,
-                                      color: Theme.of(
-                                        context,
-                                      ).colorScheme.surfaceContainerLow,
-                                      child: ListView.builder(
-                                        controller:
-                                            tab.lineNumbersScrollController,
-                                        itemExtent: lineHeight,
-                                        itemCount: lineCount,
-                                        itemBuilder: (context, index) {
-                                          return Container(
-                                            height: lineHeight,
-                                            alignment: Alignment.centerRight,
-                                            padding: const EdgeInsets.only(
-                                              right: 8.0,
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              suffixIcon: IconButton(
+                                icon: const Icon(Icons.arrow_forward),
+                                onPressed: _performSearch,
+                              ),
+                            ),
+                            onSubmitted: (_) => _performSearch(),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                Expanded(
+                  child: _tabs.isEmpty
+                      ? const Center(child: Text('No tabs open'))
+                      : TabBarView(
+                          controller: _tabController,
+                          physics:
+                              const NeverScrollableScrollPhysics(), // Disable swipe
+                          children: _tabs.map((tab) {
+                            final lineCount = tab.lineCount;
+                            final lineHeight = _fontSize * 1.5;
+                            final isDark =
+                                Theme.of(context).brightness == Brightness.dark;
+                            final lineNumberStyle = TextStyle(
+                              fontFamily: _fontFamily,
+                              fontSize: _fontSize,
+                              color: isDark ? Colors.grey[600] : Colors.grey,
+                              height: 1.5,
+                            );
+                            final editorStyle = TextStyle(
+                              fontFamily: _fontFamily,
+                              fontSize: _fontSize,
+                              height: 1.5,
+                            );
+
+                            return Column(
+                              children: [
+                                Expanded(
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 0.0,
+                                      vertical: 8.0,
+                                    ),
+                                    child: Row(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        if (_showLineNumbers)
+                                          Container(
+                                            width: 50,
+                                            color: Theme.of(
+                                              context,
+                                            ).colorScheme.surfaceContainerLow,
+                                            child: ListView.builder(
+                                              controller: tab
+                                                  .lineNumbersScrollController,
+                                              itemExtent: lineHeight,
+                                              itemCount: lineCount,
+                                              itemBuilder: (context, index) {
+                                                return Container(
+                                                  height: lineHeight,
+                                                  alignment:
+                                                      Alignment.centerRight,
+                                                  padding:
+                                                      const EdgeInsets.only(
+                                                        right: 8.0,
+                                                      ),
+                                                  child: Text(
+                                                    '${index + 1}',
+                                                    style: lineNumberStyle,
+                                                  ),
+                                                );
+                                              },
                                             ),
-                                            child: Text(
-                                              '${index + 1}',
-                                              style: TextStyle(
-                                                fontFamily: _fontFamily,
-                                                fontSize: _fontSize,
-                                                color: Colors.grey,
-                                                height: 1.5,
+                                          ),
+                                        Expanded(
+                                          child: Padding(
+                                            padding: const EdgeInsets.only(
+                                              left: 8.0,
+                                              right: 16.0,
+                                            ),
+                                            child: Shortcuts(
+                                              shortcuts: {
+                                                LogicalKeySet(
+                                                  LogicalKeyboardKey.tab,
+                                                ): const IndentIntent(),
+                                              },
+                                              child: Actions(
+                                                actions: {
+                                                  IndentIntent:
+                                                      CallbackAction<
+                                                        IndentIntent
+                                                      >(
+                                                        onInvoke: (intent) =>
+                                                            _handleIndent(tab),
+                                                      ),
+                                                },
+                                                child: _isWordWrap
+                                                    ? Scrollbar(
+                                                        controller: tab
+                                                            .textScrollController,
+                                                        thumbVisibility: true,
+                                                        child: TextField(
+                                                          controller:
+                                                              tab.controller,
+                                                          focusNode:
+                                                              tab.focusNode,
+                                                          scrollController: tab
+                                                              .textScrollController,
+                                                          maxLines: null,
+                                                          expands: true,
+                                                          keyboardType:
+                                                              TextInputType
+                                                                  .multiline,
+                                                          scrollPhysics:
+                                                              const AlwaysScrollableScrollPhysics(),
+                                                          onTap: () =>
+                                                              _updateCursorPosition(
+                                                                tab,
+                                                              ),
+                                                          style: editorStyle,
+                                                          decoration:
+                                                              const InputDecoration(
+                                                                border:
+                                                                    InputBorder
+                                                                        .none,
+                                                                hintText:
+                                                                    'Start typing...',
+                                                              ),
+                                                        ),
+                                                      )
+                                                    : LayoutBuilder(
+                                                        builder: (context, constraints) {
+                                                          return Scrollbar(
+                                                            controller: tab
+                                                                .textScrollController,
+                                                            thumbVisibility:
+                                                                true,
+                                                            child: SingleChildScrollView(
+                                                              scrollDirection:
+                                                                  Axis.horizontal,
+                                                              child: ConstrainedBox(
+                                                                constraints: BoxConstraints(
+                                                                  minWidth:
+                                                                      constraints
+                                                                          .maxWidth,
+                                                                  maxWidth: max(
+                                                                    constraints
+                                                                        .maxWidth,
+                                                                    _contentWidth,
+                                                                  ),
+                                                                  minHeight:
+                                                                      constraints
+                                                                          .maxHeight,
+                                                                  maxHeight:
+                                                                      constraints
+                                                                          .maxHeight,
+                                                                ),
+                                                                child: TextField(
+                                                                  controller: tab
+                                                                      .controller,
+                                                                  focusNode: tab
+                                                                      .focusNode,
+                                                                  scrollController:
+                                                                      tab.textScrollController,
+                                                                  maxLines:
+                                                                      null,
+                                                                  expands: true,
+                                                                  keyboardType:
+                                                                      TextInputType
+                                                                          .multiline,
+                                                                  scrollPhysics:
+                                                                      const AlwaysScrollableScrollPhysics(),
+                                                                  onTap: () =>
+                                                                      _updateCursorPosition(
+                                                                        tab,
+                                                                      ),
+                                                                  style:
+                                                                      editorStyle,
+                                                                  decoration: const InputDecoration(
+                                                                    border:
+                                                                        InputBorder
+                                                                            .none,
+                                                                    hintText:
+                                                                        'Start typing...',
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          );
+                                                        },
+                                                      ),
                                               ),
                                             ),
-                                          );
-                                        },
-                                      ),
-                                    ),
-                                  Expanded(
-                                    child: Padding(
-                                      padding: const EdgeInsets.only(
-                                        left: 8.0,
-                                        right: 16.0,
-                                      ),
-                                      child: Shortcuts(
-                                        shortcuts: {
-                                          LogicalKeySet(LogicalKeyboardKey.tab):
-                                              const IndentIntent(),
-                                        },
-                                        child: Actions(
-                                          actions: {
-                                            IndentIntent:
-                                                CallbackAction<IndentIntent>(
-                                                  onInvoke: (intent) =>
-                                                      _handleIndent(tab),
-                                                ),
-                                          },
-                                          child: _isWordWrap
-                                              ? Scrollbar(
-                                                  controller:
-                                                      tab.textScrollController,
-                                                  thumbVisibility: true,
-                                                  child: TextField(
-                                                    controller: tab.controller,
-                                                    focusNode: tab.focusNode,
-                                                    scrollController: tab
-                                                        .textScrollController,
-                                                    maxLines: null,
-                                                    expands: true,
-                                                    keyboardType:
-                                                        TextInputType.multiline,
-                                                    scrollPhysics:
-                                                        const AlwaysScrollableScrollPhysics(),
-                                                    onTap: () =>
-                                                        _updateCursorPosition(
-                                                          tab,
-                                                        ),
-                                                    style: TextStyle(
-                                                      fontFamily: _fontFamily,
-                                                      fontSize: _fontSize,
-                                                      height: 1.5,
-                                                    ),
-                                                    decoration:
-                                                        const InputDecoration(
-                                                          border:
-                                                              InputBorder.none,
-                                                          hintText:
-                                                              'Start typing...',
-                                                        ),
-                                                  ),
-                                                )
-                                              : LayoutBuilder(
-                                                  builder: (context, constraints) {
-                                                    return Scrollbar(
-                                                      controller: tab
-                                                          .textScrollController,
-                                                      thumbVisibility: true,
-                                                      child: SingleChildScrollView(
-                                                        scrollDirection:
-                                                            Axis.horizontal,
-                                                        child: ConstrainedBox(
-                                                          constraints: BoxConstraints(
-                                                            minWidth:
-                                                                constraints
-                                                                    .maxWidth,
-                                                            maxWidth: max(
-                                                              constraints
-                                                                  .maxWidth,
-                                                              _contentWidth,
-                                                            ),
-                                                            minHeight:
-                                                                constraints
-                                                                    .maxHeight,
-                                                            maxHeight:
-                                                                constraints
-                                                                    .maxHeight,
-                                                          ),
-                                                          child: TextField(
-                                                            controller:
-                                                                tab.controller,
-                                                            focusNode:
-                                                                tab.focusNode,
-                                                            scrollController: tab
-                                                                .textScrollController,
-                                                            maxLines: null,
-                                                            expands: true,
-                                                            keyboardType:
-                                                                TextInputType
-                                                                    .multiline,
-                                                            scrollPhysics:
-                                                                const AlwaysScrollableScrollPhysics(),
-                                                            onTap: () =>
-                                                                _updateCursorPosition(
-                                                                  tab,
-                                                                ),
-                                                            style: TextStyle(
-                                                              fontFamily:
-                                                                  _fontFamily,
-                                                              fontSize:
-                                                                  _fontSize,
-                                                              height: 1.5,
-                                                            ),
-                                                            decoration:
-                                                                const InputDecoration(
-                                                                  border:
-                                                                      InputBorder
-                                                                          .none,
-                                                                  hintText:
-                                                                      'Start typing...',
-                                                                ),
-                                                          ),
-                                                        ),
-                                                      ),
-                                                    );
-                                                  },
-                                                ),
+                                          ),
                                         ),
-                                      ),
+                                      ],
                                     ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 16.0,
-                              vertical: 8.0,
-                            ),
-                            color: Theme.of(
-                              context,
-                            ).colorScheme.surfaceContainer,
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                Text(
-                                  'Ln ${tab.currentLine}, Col ${tab.currentColumn}',
-                                  style: TextStyle(
-                                    color: Theme.of(
-                                      context,
-                                    ).colorScheme.onSurfaceVariant,
-                                    fontSize: 12,
                                   ),
                                 ),
-                                Text(
-                                  '${tab.language}  |  UTF-8  |  ${tab.characterCount} chars',
-                                  style: TextStyle(
-                                    color: Theme.of(
-                                      context,
-                                    ).colorScheme.onSurfaceVariant,
-                                    fontSize: 12,
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 16.0,
+                                    vertical: 8.0,
+                                  ),
+                                  color: Theme.of(
+                                    context,
+                                  ).colorScheme.surfaceContainer,
+                                  child: Row(
+                                    mainAxisAlignment:
+                                        MainAxisAlignment.spaceBetween,
+                                    children: [
+                                      Text(
+                                        'Ln ${tab.currentLine}, Col ${tab.currentColumn}',
+                                        style: TextStyle(
+                                          color: Theme.of(
+                                            context,
+                                          ).colorScheme.onSurfaceVariant,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                      Text(
+                                        '${tab.language}  |  UTF-8  |  ${tab.characterCount} chars',
+                                        style: TextStyle(
+                                          color: Theme.of(
+                                            context,
+                                          ).colorScheme.onSurfaceVariant,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    ],
                                   ),
                                 ),
                               ],
-                            ),
-                          ),
-                        ],
-                      );
-                    }).toList(),
-                  ),
+                            );
+                          }).toList(),
+                        ),
+                ),
+              ],
+            ),
           ),
-        ],
+        ),
       ),
     );
   }

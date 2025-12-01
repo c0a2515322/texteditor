@@ -6,6 +6,9 @@ class CustomTextEditingController extends TextEditingController {
   bool showWhitespaces = false;
   Result? _highlightResult;
   TextSpan? _cachedTextSpan;
+  TextStyle? _cachedStyle;
+  String? _cachedText;
+  bool? _cachedIsDark;
 
   CustomTextEditingController({super.text});
 
@@ -14,6 +17,9 @@ class CustomTextEditingController extends TextEditingController {
   set highlightResult(Result? result) {
     _highlightResult = result;
     _cachedTextSpan = null; // Invalidate cache
+    _cachedText = null;
+    _cachedStyle = null;
+    _cachedIsDark = null;
     notifyListeners();
   }
 
@@ -21,6 +27,9 @@ class CustomTextEditingController extends TextEditingController {
   set value(TextEditingValue newValue) {
     if (super.value != newValue) {
       _cachedTextSpan = null; // Invalidate cache on text change
+      _cachedText = null;
+      _cachedStyle = null;
+      _cachedIsDark = null;
       _highlightResult = null; // Clear stale highlight result
       super.value = newValue;
     }
@@ -32,9 +41,13 @@ class CustomTextEditingController extends TextEditingController {
     TextStyle? style,
     required bool withComposing,
   }) {
-    // Return cached span if available and style matches (simplified check)
-    // Note: Strictly speaking we should check if style changed, but for now we assume style is relatively stable
-    if (_cachedTextSpan != null) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+
+    // Return cached span if available and conditions match
+    if (_cachedTextSpan != null &&
+        _cachedText == value.text &&
+        _cachedStyle == style &&
+        _cachedIsDark == isDark) {
       return _cachedTextSpan!;
     }
 
@@ -52,10 +65,13 @@ class CustomTextEditingController extends TextEditingController {
       }
     } else {
       // If highlight result exists, build spans from nodes
-      span = _buildHighlightSpans(_highlightResult!.nodes!, style);
+      span = _buildHighlightSpans(_highlightResult!.nodes!, style, isDark);
     }
 
     _cachedTextSpan = span;
+    _cachedText = value.text;
+    _cachedStyle = style;
+    _cachedIsDark = isDark;
     return span;
   }
 
@@ -89,18 +105,22 @@ class CustomTextEditingController extends TextEditingController {
     return TextSpan(style: style, children: children);
   }
 
-  TextSpan _buildHighlightSpans(List<Node> nodes, TextStyle? style) {
+  TextSpan _buildHighlightSpans(
+    List<Node> nodes,
+    TextStyle? style,
+    bool isDark,
+  ) {
     List<TextSpan> spans = [];
     for (var node in nodes) {
-      spans.add(_convertNodeToSpan(node, style));
+      spans.add(_convertNodeToSpan(node, style, isDark));
     }
     return TextSpan(style: style, children: spans);
   }
 
-  TextSpan _convertNodeToSpan(Node node, TextStyle? style) {
+  TextSpan _convertNodeToSpan(Node node, TextStyle? style, bool isDark) {
     TextStyle? nodeStyle = style;
     if (node.className != null) {
-      nodeStyle = _getThemeStyle(node.className!, style);
+      nodeStyle = _getThemeStyle(node.className!, style, isDark);
     }
 
     if (node.value != null) {
@@ -111,7 +131,7 @@ class CustomTextEditingController extends TextEditingController {
     } else if (node.children != null) {
       return TextSpan(
         children: node.children!
-            .map((n) => _convertNodeToSpan(n, nodeStyle))
+            .map((n) => _convertNodeToSpan(n, nodeStyle, isDark))
             .toList(),
         style: nodeStyle,
       );
@@ -119,44 +139,81 @@ class CustomTextEditingController extends TextEditingController {
     return const TextSpan();
   }
 
-  TextStyle? _getThemeStyle(String className, TextStyle? baseStyle) {
-    // Simple theme mapping
-    // Ideally this should be configurable or load a standard theme
+  TextStyle? _getThemeStyle(
+    String className,
+    TextStyle? baseStyle,
+    bool isDark,
+  ) {
     Color? color;
     FontWeight? fontWeight;
     FontStyle? fontStyle;
 
-    switch (className) {
-      case 'keyword':
-      case 'selector-tag':
-      case 'section':
-      case 'title':
-      case 'name':
-        color = Colors.purple[700];
-        fontWeight = FontWeight.bold;
-        break;
-      case 'string':
-      case 'attr':
-        color = Colors.green[800];
-        break;
-      case 'number':
-      case 'literal':
-        color = Colors.orange[900];
-        break;
-      case 'comment':
-        color = Colors.grey[600];
-        fontStyle = FontStyle.italic;
-        break;
-      case 'built_in':
-      case 'type':
-        color = Colors.blue[800];
-        break;
-      case 'function':
-        color = Colors.brown[700];
-        break;
-      default:
-        // Keep base style
-        break;
+    if (isDark) {
+      // Dark theme colors
+      switch (className) {
+        case 'keyword':
+        case 'selector-tag':
+        case 'section':
+        case 'title':
+        case 'name':
+          color = Colors.purple[300];
+          fontWeight = FontWeight.bold;
+          break;
+        case 'string':
+        case 'attr':
+          color = Colors.green[400];
+          break;
+        case 'number':
+        case 'literal':
+          color = Colors.orange[300];
+          break;
+        case 'comment':
+          color = Colors.grey[500];
+          fontStyle = FontStyle.italic;
+          break;
+        case 'built_in':
+        case 'type':
+          color = Colors.cyan[300];
+          break;
+        case 'function':
+          color = Colors.amber[300];
+          break;
+        default:
+          break;
+      }
+    } else {
+      // Light theme colors
+      switch (className) {
+        case 'keyword':
+        case 'selector-tag':
+        case 'section':
+        case 'title':
+        case 'name':
+          color = Colors.purple[700];
+          fontWeight = FontWeight.bold;
+          break;
+        case 'string':
+        case 'attr':
+          color = Colors.green[800];
+          break;
+        case 'number':
+        case 'literal':
+          color = Colors.orange[900];
+          break;
+        case 'comment':
+          color = Colors.grey[600];
+          fontStyle = FontStyle.italic;
+          break;
+        case 'built_in':
+        case 'type':
+          color = Colors.blue[800];
+          break;
+        case 'function':
+          color = Colors.brown[700];
+          break;
+        default:
+          break;
+      }
     }
 
     if (color != null || fontWeight != null || fontStyle != null) {

@@ -23,17 +23,21 @@ class EditorTabState {
   String language = 'plaintext';
   bool enableHighlight = true;
 
-  Timer? _debounceTimer;
+  Timer? debounceTimer;
+  Timer? undoDebounceTimer;
+  String? pendingUndoText;
 
   // Cursor position
   int currentLine = 1;
   int currentColumn = 1;
   int characterCount = 0;
+  int lineCount = 1; // Cached line count for performance
 
   EditorTabState({this.filePath, String initialContent = ''}) {
     content = initialContent;
     controller = CustomTextEditingController(text: initialContent);
     characterCount = initialContent.length;
+    lineCount = initialContent.isEmpty ? 1 : initialContent.split('\n').length;
     _detectLanguage();
     // Initial highlight without debounce
     updateHighlight(immediate: true);
@@ -87,7 +91,7 @@ class EditorTabState {
   }
 
   void updateHighlight({bool immediate = false}) {
-    _debounceTimer?.cancel();
+    debounceTimer?.cancel();
 
     if (!enableHighlight || language == 'plaintext') {
       if (controller.highlightResult != null) {
@@ -124,13 +128,14 @@ class EditorTabState {
     if (immediate) {
       performUpdate();
     } else {
-      // Short debounce to balance responsiveness and performance
-      _debounceTimer = Timer(const Duration(milliseconds: 75), performUpdate);
+      // Debounce to balance responsiveness and performance
+      debounceTimer = Timer(const Duration(milliseconds: 200), performUpdate);
     }
   }
 
   void dispose() {
-    _debounceTimer?.cancel();
+    debounceTimer?.cancel();
+    undoDebounceTimer?.cancel();
     controller.dispose();
     textScrollController.dispose();
     lineNumbersScrollController.dispose();
